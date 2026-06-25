@@ -605,4 +605,16 @@ export default {
 
         if (result.error) {
           return jsonResp({ success: false, error: result.error, "⏱ Response Time": responseTime }, 400);
-          }
+        }
+
+        const data = {
+          ...result,
+          "🔗 Input URL":    inputUrl,
+          "⏱ Response Time": responseTime,
+          "Made By":         "@AnujOfficial",
+        };
+
+        cache.set(cacheKey, { data, expiry: Date.now() + CACHE_TTL });
+        return jsonResp({ success: true, cached: false, data });
+      } catch (e) {
+        return jsonResp({ success: 
