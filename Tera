@@ -1,0 +1,586 @@
+// =============================================
+// Terabox Direct Link Extractor v2.0
+// HLS + Subtitle + Built-in Proxy (cookie injection)
+// =============================================
+
+const UA_DESKTOP = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+const CACHE_TTL  = 2 * 60 * 60 * 1000;
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type, Authorization",
+};
+
+const cache = new Map();
+
+// ── UTILS ────────────────────────────────────────────────────────────────────
+
+function jsonResp(data, status = 200) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status,
+    headers: { "Content-Type": "application/json", ...corsHeaders },
+  });
+}
+
+function formatBytes(bytes) {
+  if (!bytes || bytes == 0) return "0 B";
+  bytes = parseInt(bytes);
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  const i = Math.floor(Math.log(bytes) / Math.log(1024));
+  return (bytes / Math.pow(1024, i)).toFixed(2) + " " + units[i];
+}
+
+function formatDuration(seconds) {
+  if (!seconds) return null;
+  const h = Math.floor(seconds / 3600);
+  const m = Math.floor((seconds % 3600) / 60);
+  const s = Math.floor(seconds % 60);
+  if (h > 0) return `${h}:${String(m).padStart(2,"0")}:${String(s).padStart(2,"0")}`;
+  return `${m}:${String(s).padStart(2,"0")}`;
+}
+
+function detectQuality(item) {
+  if (item.video_info?.clarification) return item.video_info.clarification;
+  const size = Number(item.size || 0);
+  if (size > 8e9)   return "4K";
+  if (size > 3e9)   return "1080p";
+  if (size > 1e9)   return "720p";
+  if (size > 400e6) return "480p";
+  if (size > 0)     return "360p";
+  return null;
+}
+
+function parseNetscapeCookies(txt) {
+  if (!txt) return {};
+  const cookies = {};
+  for (const line of txt.split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+    const parts = t.split("\t");
+    if (parts.length >= 7) cookies[parts[5].trim()] = parts[6].trim();
+  }
+  return cookies;
+}
+
+function getNdus(env) {
+  if (env.NDUS_COOKIE) return env.NDUS_COOKIE.trim();
+  if (env.TERABOX_COOKIES_TXT) return parseNetscapeCookies(env.TERABOX_COOKIES_TXT)["ndus"] || "";
+  return "";
+}
+
+// Build proxy URL — direct playable in any player
+function buildProxyUrl(workerOrigin, targetUrl) {
+  return `${workerOrigin}/proxy?url=${encodeURIComponent(targetUrl)}`;
+}
+
+// =============================================
+// SUBTITLE M3U8 CONVERTER
+// =============================================
+
+function buildSubtitleM3U8(subtitleInfoArray, workerOrigin) {
+  if (!subtitleInfoArray?.length) return null;
+  let m3u8 = "#EXTM3U\n";
+  for (const sub of subtitleInfoArray) {
+    const lang     = sub.lan       || sub.language || sub.lang || "und";
+    const langName = sub.lan_name  || sub.language_name || lang.toUpperCase();
+    const rawUrl   = sub.url       || sub.subtitle_url || "";
+    if (!rawUrl) continue;
+    const proxied = buildProxyUrl(workerOrigin, rawUrl);
+    m3u8 += `#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID="subs",LANGUAGE="${lang}",NAME="${langName}",URI="${proxied}"\n`;
+  }
+  return m3u8;
+}
+
+function buildSubtitleResponse(subtitleInfoArray, workerOrigin) {
+  if (!subtitleInfoArray?.length) return null;
+  return {
+    format: "M3U8",
+    count:  subtitleInfoArray.length,
+    m3u8_playlist: buildSubtitleM3U8(subtitleInfoArray, workerOrigin),
+    languages: subtitleInfoArray.map(s => ({
+      language:      s.lan       || s.language || s.lang || "und",
+      language_name: s.lan_name  || s.language_name || "Unknown",
+      url:           buildProxyUrl(workerOrigin, s.url || s.subtitle_url || ""),
+      raw_url:       s.url || s.subtitle_url || null,
+    })),
+  };
+}
+
+// =============================================
+// URL VALIDATORS
+// =============================================
+
+const TERABOX_DOMAINS = [
+  "terabox.app","teraboxapp.com","www.terabox.com","dm.terabox.app",
+  "1024terabox.com","1024tera.com","terabox.fun","terasharefile.com",
+  "terasharelink.com","teraboxlink.com","mirrobox.com","nephobox.com",
+  "freeterabox.com","4funbox.com","tibibox.com","tobybox.com",
+  "momerybox.com","jobebox.com","gibibox.com","gomafiles.com",
+  "boxlinks.net","terabox.club","terabox.site","terabox.online",
+  "terabox.live","teraboxshare.com","terafileshare.com","teradlbox.com",
+  "teradownload.app","terabox.in",
+];
+
+function isTeraboxUrl(url) {
+  try {
+    const p = new URL(url);
+    return TERABOX_DOMAINS.some(d => p.hostname.includes(d));
+  } catch { return false; }
+}
+
+function extractSurl(url) {
+  try {
+    const p = new URL(url);
+    const m = p.pathname.match(/\/s\/([a-zA-Z0-9_-]+)/);
+    if (m) return m[1];
+    return p.searchParams.get("surl") || null;
+  } catch { return null; }
+}
+
+// =============================================
+// TERABOX FETCHER
+// =============================================
+
+async function fetchTeraboxData(surl, ndus, workerOrigin) {
+  let short_url = surl;
+  if (surl.startsWith("1")) short_url = surl.substring(1);
+  const cookieStr = `ndus=${ndus}`;
+
+  // Step 1: jsToken
+  const firstResp = await fetch(`https://dm.terabox.app/sharing/link?surl=${surl}`, {
+    headers: { "User-Agent": UA_DESKTOP, "Cookie": cookieStr },
+  });
+  const text = await firstResp.text();
+  const match = text.match(/fn%28%22(.*?)%22%29/);
+  if (!match) return { error: "jsToken extract nahi hua. Cookie expire ho gayi hogi." };
+  const jsToken = match[1];
+
+  // Step 2: Share list
+  const apiUrl = new URL("https://dm.terabox.app/share/list");
+  apiUrl.searchParams.append("app_id", "250528");
+  apiUrl.searchParams.append("jsToken", jsToken);
+  apiUrl.searchParams.append("site_referer", "https://www.terabox.app/");
+  apiUrl.searchParams.append("shorturl", short_url);
+  apiUrl.searchParams.append("root", "1");
+
+  const apiResp = await fetch(apiUrl.toString(), {
+    headers: {
+      "Host": "dm.terabox.app",
+      "User-Agent": UA_DESKTOP,
+      "Accept": "application/json, text/plain, */*",
+      "Accept-Language": "en-US,en;q=0.9",
+      "X-Requested-With": "XMLHttpRequest",
+      "Referer": `https://dm.terabox.app/sharing/link?surl=${short_url}&clearCache=1`,
+      "Content-Type": "application/x-www-form-urlencoded",
+      "Origin": "https://dm.terabox.app",
+      "Cookie": cookieStr,
+    },
+  });
+
+  const result = await apiResp.json();
+  if (!result.list?.length) {
+    return { error: "Files nahi mile. Link expired ya invalid hai.", raw: result };
+  }
+
+  const shareInfo = {
+    shareid:   result.shareid,
+    uk:        result.uk,
+    sign:      result.sign,
+    timestamp: result.timestamp,
+  };
+
+  const rawFolders = result.list.filter(i => i.isdir === "1");
+  const rawFiles   = result.list.filter(i => i.isdir !== "1");
+
+  let allFolderFiles = [];
+  for (const folder of rawFolders) {
+    const sub = await fetchFolderFiles(folder.path, short_url, jsToken, shareInfo, cookieStr);
+    allFolderFiles = allFolderFiles.concat(sub);
+  }
+
+  const allRawFiles = [...rawFiles, ...allFolderFiles];
+  const files = await Promise.all(
+    allRawFiles.map(item => processFile(item, shareInfo, cookieStr, workerOrigin))
+  );
+
+  const folders = rawFolders.map(i => ({
+    "📁 Name":      i.server_filename,
+    "📋 Type":      "folder",
+    "📍 Full Path": i.path || i.server_filename,
+  }));
+
+  return {
+    "✅ Status":   "Success",
+    "📂 Folders":  folders,
+    "📄 Files":    files,
+    "📊 Summary": {
+      "📂 Total Folders": folders.length,
+      "📄 Total Files":   files.length,
+      "🔢 Total Items":   folders.length + files.length,
+    },
+  };
+}
+
+async function fetchFolderFiles(folderPath, short_url, jsToken, shareInfo, cookieStr) {
+  try {
+    const url = new URL("https://dm.terabox.app/share/list");
+    url.searchParams.append("app_id", "250528");
+    url.searchParams.append("jsToken", jsToken);
+    url.searchParams.append("shorturl", short_url);
+    url.searchParams.append("dir", folderPath);
+    url.searchParams.append("num", "100");
+
+    const resp = await fetch(url.toString(), {
+      headers: {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": cookieStr,
+        "Referer": `https://dm.terabox.app/sharing/link?surl=${short_url}`,
+      },
+    });
+
+    const data = await resp.json();
+    const items = data.list || [];
+    let result = [];
+    for (const item of items) {
+      if (item.isdir === "1") {
+        const sub = await fetchFolderFiles(item.path, short_url, jsToken, shareInfo, cookieStr);
+        result = result.concat(sub);
+      } else {
+        result.push(item);
+      }
+    }
+    return result;
+  } catch { return []; }
+}
+
+async function processFile(item, shareInfo, cookieStr, workerOrigin) {
+  const isVideo = String(item.category) === "1";
+  const isAudio = String(item.category) === "2";
+
+  let fast_stream_url = null;
+  let stream_url      = item.dlink || null;
+  let subtitle_url    = null;
+
+  if (isVideo && shareInfo.shareid && shareInfo.uk) {
+    const hls = await fetchHLSUrls(item, shareInfo, cookieStr, workerOrigin);
+    fast_stream_url = hls.fast_stream_url;
+    stream_url      = hls.stream_url || stream_url;
+    subtitle_url    = hls.subtitle_url;
+  }
+
+  return {
+    "📁 Name":                  item.server_filename,
+    "📋 Type":                  isVideo ? "video" : isAudio ? "audio" : "file",
+    "📍 Full Path":             item.path || item.server_filename,
+    "✏️ Size":                  formatBytes(item.size),
+    "📐 Size Bytes":            Number(item.size || 0),
+    "🎬 Duration":              item.duration ? formatDuration(Number(item.duration)) : null,
+    "📺 Quality":               detectQuality(item),
+    "🖼 Thumbnails":            item.thumbs || null,
+    "🔗 Direct Download Link":  item.dlink || null,
+    "▶️ Stream URL":            stream_url,
+    "⚡ Fast Stream URL (HLS)": fast_stream_url,
+    "📝 Subtitle (M3U8)":       subtitle_url,
+    "🆔 fs_id":                 String(item.fs_id || ""),
+  };
+}
+
+// =============================================
+// HLS + SUBTITLE FETCHER (FIXED)
+// =============================================
+
+async function fetchHLSUrls(item, shareInfo, cookieStr, workerOrigin) {
+  const result = { fast_stream_url: null, stream_url: null, subtitle_url: null };
+
+  if (!shareInfo.uk || !shareInfo.shareid || !shareInfo.sign || !shareInfo.timestamp) {
+    return result;
+  }
+
+  // ─── 1) HLS URLs via /share/streaming endpoint ─────────────────────────
+  const qualityTypes = {
+    "360p":  "M3U8_AUTO_360",
+    "480p":  "M3U8_AUTO_480",
+    "720p":  "M3U8_AUTO_720",
+    "1080p": "M3U8_AUTO_1080",
+    "4K":    "M3U8_AUTO_2160",
+  };
+
+  const hlsRaw = {};
+  const hlsProxied = {};
+  for (const [quality, type] of Object.entries(qualityTypes)) {
+    const s = new URL("https://dm.terabox.app/share/streaming");
+    s.searchParams.append("app_id",     "250528");
+    s.searchParams.append("clienttype", "0");
+    s.searchParams.append("channel",    "dubox");
+    s.searchParams.append("web",        "1");
+    s.searchParams.append("uk",         shareInfo.uk);
+    s.searchParams.append("shareid",    shareInfo.shareid);
+    s.searchParams.append("fid",        item.fs_id);
+    s.searchParams.append("timestamp",  shareInfo.timestamp);
+    s.searchParams.append("sign",       shareInfo.sign);
+    s.searchParams.append("type",       type);
+    s.searchParams.append("vip",        "0");
+    const raw = s.toString();
+    hlsRaw[quality] = raw;
+    hlsProxied[quality] = buildProxyUrl(workerOrigin, raw);
+  }
+  result.fast_stream_url = hlsProxied;
+
+  // ─── 2) Media Meta — for subtitles + normal mp4 URL ────────────────────
+  try {
+    const metaUrl = new URL("https://dm.terabox.app/share/mediameta");
+    metaUrl.searchParams.append("app_id",     "250528");
+    metaUrl.searchParams.append("clienttype", "0");
+    metaUrl.searchParams.append("channel",    "dubox");
+    metaUrl.searchParams.append("web",        "1");
+    metaUrl.searchParams.append("uk",         shareInfo.uk);
+    metaUrl.searchParams.append("shareid",    shareInfo.shareid);
+    metaUrl.searchParams.append("fid_list",   `[${item.fs_id}]`);
+    metaUrl.searchParams.append("timestamp",  shareInfo.timestamp);
+    metaUrl.searchParams.append("sign",       shareInfo.sign);
+
+    const resp = await fetch(metaUrl.toString(), {
+      headers: {
+        "User-Agent": UA_DESKTOP,
+        "Accept": "application/json, text/plain, */*",
+        "Cookie": cookieStr,
+        "Referer": "https://dm.terabox.app/",
+        "Origin": "https://dm.terabox.app",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+    });
+
+    if (resp.ok) {
+      const meta = await resp.json();
+      const entry = meta.list?.[0] || meta;
+
+      result.stream_url =
+        entry.video_info?.normal_video_url ||
+        entry.video_info?.video_url        ||
+        entry.normal_video_url             ||
+        entry.dlink                        ||
+        result.stream_url;
+
+      const subInfo =
+        entry.subtitle_info ||
+        entry.video_info?.subtitle_info ||
+        meta.subtitle_info ||
+        [];
+
+      if (Array.isArray(subInfo) && subInfo.length) {
+        result.subtitle_url = buildSubtitleResponse(subInfo, workerOrigin);
+      }
+    }
+  } catch { /* HLS already set */ }
+
+  return result;
+}
+
+// =============================================
+// PROXY ENDPOINT — Injects cookie so M3U8/segments
+// play directly in any player (VLC/MX/hls.js)
+// =============================================
+
+async function handleProxy(request, env) {
+  const url = new URL(request.url);
+  const target = url.searchParams.get("url");
+  if (!target) return new Response("Missing url param", { status: 400, headers: corsHeaders });
+
+  let targetUrl;
+  try { targetUrl = new URL(target); }
+  catch { return new Response("Invalid url", { status: 400, headers: corsHeaders }); }
+
+  // Only allow Terabox-related hosts
+  const allowedHostFragment = [
+    "terabox", "1024tera", "mirrobox", "nephobox", "freeterabox",
+    "4funbox", "tibibox", "tobybox", "momerybox", "jobebox", "gibibox",
+    "boxlinks", "teradlbox", "teradownload", "dubox",
+  ];
+  if (!allowedHostFragment.some(h => targetUrl.hostname.includes(h))) {
+    return new Response("Host not allowed", { status: 403, headers: corsHeaders });
+  }
+
+  const ndus = getNdus(env);
+  const headers = {
+    "User-Agent": UA_DESKTOP,
+    "Accept": "*/*",
+    "Referer": "https://dm.terabox.app/",
+    "Origin":  "https://dm.terabox.app",
+  };
+  if (ndus) headers["Cookie"] = `ndus=${ndus}`;
+
+  // Forward Range header (for video seeking)
+  const range = request.headers.get("Range");
+  if (range) headers["Range"] = range;
+
+  const upstream = await fetch(targetUrl.toString(), {
+    method: request.method,
+    headers,
+    redirect: "follow",
+  });
+
+  const ct = (upstream.headers.get("Content-Type") || "").toLowerCase();
+  const isM3U8 =
+    ct.includes("mpegurl") ||
+    ct.includes("vnd.apple") ||
+    targetUrl.pathname.endsWith(".m3u8") ||
+    targetUrl.searchParams.get("type")?.startsWith("M3U8");
+
+  // Build worker origin for rewriting
+  const workerOrigin = `${url.protocol}//${url.host}`;
+
+  if (isM3U8) {
+    let body = await upstream.text();
+    body = rewriteM3U8(body, targetUrl, workerOrigin);
+
+    const respHeaders = new Headers({
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache",
+      ...corsHeaders,
+    });
+    return new Response(body, { status: upstream.status, headers: respHeaders });
+  }
+
+  // For binary (.ts segments, mp4, subtitle, etc.) — stream-through
+  const respHeaders = new Headers(upstream.headers);
+  for (const [k, v] of Object.entries(corsHeaders)) respHeaders.set(k, v);
+  respHeaders.delete("Set-Cookie");
+  respHeaders.delete("Content-Security-Policy");
+
+  return new Response(upstream.body, {
+    status: upstream.status,
+    headers: respHeaders,
+  });
+}
+
+// Rewrite all URLs inside .m3u8 so they also go through proxy
+function rewriteM3U8(text, baseUrl, workerOrigin) {
+  const lines = text.split(/\r?\n/);
+  const out = [];
+  for (let line of lines) {
+    const trimmed = line.trim();
+
+    if (!trimmed) { out.push(line); continue; }
+
+    // Lines starting with # but containing URI="..."
+    if (trimmed.startsWith("#")) {
+      line = line.replace(/URI="([^"]+)"/g, (_, u) => {
+        const abs = resolveUrl(u, baseUrl);
+        return `URI="${workerOrigin}/proxy?url=${encodeURIComponent(abs)}"`;
+      });
+      out.push(line);
+      continue;
+    }
+
+    // Plain URL line (segment or sub-playlist)
+    const abs = resolveUrl(trimmed, baseUrl);
+    out.push(`${workerOrigin}/proxy?url=${encodeURIComponent(abs)}`);
+  }
+  return out.join("\n");
+}
+
+function resolveUrl(maybeRelative, baseUrl) {
+  try { return new URL(maybeRelative, baseUrl).toString(); }
+  catch { return maybeRelative; }
+}
+
+// =============================================
+// MAIN WORKER
+// =============================================
+
+export default {
+  async fetch(request, env, ctx) {
+    const url  = new URL(request.url);
+    const path = url.pathname;
+    const workerOrigin = `${url.protocol}//${url.host}`;
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    // ── Proxy ────────────────────────────────────────────────────────────
+    if (path === "/proxy") {
+      return handleProxy(request, env);
+    }
+
+    // ── Home ─────────────────────────────────────────────────────────────
+    if (path === "/") {
+      return jsonResp({
+        "✅ Status": "Operational",
+        "API":       "Terabox Direct Link Extractor v2.0",
+        "Made By":   "@AnujOfficial",
+        "Features": [
+          "Netscape cookies.txt support",
+          "Folder support (recursive)",
+          "HLS streaming (360p / 480p / 720p / 1080p / 4K) — PROXIED",
+          "MP4 stream_url",
+          "Subtitle M3U8 (multi-language) — PROXIED",
+          "Built-in /proxy endpoint (auto cookie injection)",
+          "Range/seeking support",
+          "Thumbnail + Duration + Quality detection",
+          "2hr In-memory Cache",
+        ],
+        "Endpoints": {
+          "GET /":                       "Info page",
+          "GET /api?url=LINK":           "Extract direct links",
+          "POST /api  body:{url:'...'}": "Same via POST",
+          "GET /proxy?url=ENCODED_URL":  "Internal proxy (auto-used by HLS)",
+          "GET /health":                 "Alive check",
+        },
+        "ENV Variables": {
+          "NDUS_COOKIE":         "Terabox ndus cookie value (REQUIRED)",
+          "TERABOX_COOKIES_TXT": "Netscape cookies.txt (fallback)",
+        },
+      });
+    }
+
+    if (path === "/health") {
+      return jsonResp({ status: "ok", timestamp: new Date().toISOString() });
+    }
+
+    // ── Main API ─────────────────────────────────────────────────────────
+    if (path === "/api") {
+      let rawUrl = url.searchParams.get("url");
+
+      if (!rawUrl && request.method === "POST") {
+        try {
+          const body = await request.json();
+          rawUrl = body.url;
+        } catch {}
+      }
+
+      if (!rawUrl?.trim()) {
+        return jsonResp({
+          success: false,
+          error: "url parameter chahiye",
+          usage: {
+            terabox: "/api?url=https://terabox.app/s/<surl>",
+            post:    'POST /api  body: { "url": "..." }',
+          },
+        }, 400);
+      }
+
+      const inputUrl  = rawUrl.trim();
+      const startTime = Date.now();
+
+      if (!isTeraboxUrl(inputUrl)) {
+        return jsonResp({
+          success: false,
+          error: "Invalid URL — Terabox ka link hona chahiye",
+          received: inputUrl,
+        }, 400);
+      }
+
+      const ndus = getNdus(env);
+      if (!ndus) {
+        return jsonResp({
+          success: false,
+          error: "NDUS_COOKIE set nahi hai. Dashboard → Settings → Variables → NDUS_COOKIE mein paste karo.",
+        }, 500);
+      }
+
+      const surl = extractSurl(inputUrl);
+      if (!surl) {
+        return jsonResp({ success: false, error:
