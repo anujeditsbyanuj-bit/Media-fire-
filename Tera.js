@@ -575,4 +575,17 @@ export default {
       if (!isTeraboxUrl(inputUrl)) {
         return jsonResp({
           success: false,
-          error: "Invalid URL — Terabox ka link hona chahiye"
+          error: "Invalid URL — Terabox ka link hona chahiye",
+          received: inputUrl,
+        }, 400);
+      }
+
+      const ndus = getNdus(env);
+      if (!ndus) {
+        return jsonResp({
+          success: false,
+          error: "NDUS_COOKIE set nahi hai. Dashboard → Settings → Variables → NDUS_COOKIE mein paste karo.",
+        }, 500);
+      }
+
+      const surl = 
