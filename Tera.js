@@ -588,4 +588,13 @@ export default {
         }, 500);
       }
 
-      const surl = 
+      const surl = extractSurl(inputUrl);
+      if (!surl) {
+        return jsonResp({ success: false, error: "Terabox surl extract nahi hua" }, 400);
+      }
+
+      const cacheKey = `tb:${surl}:${workerOrigin}`;
+      const cached = cache.get(cacheKey);
+      if (cached && Date.now() < cached.expiry) {
+        return jsonResp({ success: true, cached: true, data: cached.data });
+    }
