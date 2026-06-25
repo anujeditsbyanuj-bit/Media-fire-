@@ -597,4 +597,12 @@ export default {
       const cached = cache.get(cacheKey);
       if (cached && Date.now() < cached.expiry) {
         return jsonResp({ success: true, cached: true, data: cached.data });
-    }
+      }
+
+      try {
+        const result = await fetchTeraboxData(surl, ndus, workerOrigin);
+        const responseTime = ((Date.now() - startTime) / 1000).toFixed(3) + "s";
+
+        if (result.error) {
+          return jsonResp({ success: false, error: result.error, "⏱ Response Time": responseTime }, 400);
+          }
